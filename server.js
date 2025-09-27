@@ -1,71 +1,73 @@
-const express = require("express");
-const mongoose = require("mongoose");
-const bodyParser = require("body-parser");
-const cors = require("cors");
-const { nanoid } = require("nanoid");
-require("dotenv").config();
+import express from "express";
+import mongoose from "mongoose";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { nanoid } from "nanoid";
+import Url from "./models/url.js";
+import Click from "./models/click.js";
+import geoip from "geoip-lite";
+import cors from "cors";
 
-const Url = require("./models/url");
-const Click = require("./models/click");
-
+dotenv.config();
 const app = express();
-app.use(cors({ origin: "https://ojaswi06.github.io" })); // allow GitHub Pages
-app.use(bodyParser.json());
+app.use(express.json());
+app.use(cors());
 
-// --- Shorten URL ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch(err => console.log(err));
+
+// Shorten URL
 app.post("/shorten", async (req, res) => {
   const { longUrl } = req.body;
-  if (!longUrl) return res.status(400).json({ message: "Missing longUrl" });
+  if (!longUrl) return res.status(400).json({ error: "URL required" });
 
   const shortId = nanoid(6);
-  const shortUrl = `${process.env.BACKEND_URL || req.get('host')}/${shortId}`;
+  const newUrl = new Url({ longUrl, shortId, clicks: 0 });
+  await newUrl.save();
 
-  const urlData = new Url({ longUrl, shortId });
-  await urlData.save();
-
-  res.json({ shortId, shortUrl });
+  res.json({ shortUrl: `${process.env.BASE_URL}/${shortId}`, shortId });
 });
 
-// --- Redirect short URL ---
+// Redirect & Track
 app.get("/:shortId", async (req, res) => {
-  const shortId = req.params.shortId;
-  try {
-    const urlData = await Url.findOne({ shortId });
-    if (!urlData) return res.status(404).send("Not Found");
+  const url = await Url.findOne({ shortId: req.params.shortId });
+  if (!url) return res.status(404).send("Not Found");
 
-    // Record click
-    await Click.create({ shortId, timestamp: new Date() });
+  url.clicks++;
+  await url.save();
 
-    // Redirect to original URL
-    res.redirect(urlData.longUrl);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server Error");
-  }
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const geo = geoip.lookup(ip) || {};
+  
+  const click = new Click({
+    shortId: url.shortId,
+    ip,
+    userAgent: req.headers["user-agent"],
+    country: geo.country || "Unknown",
+    region: geo.region || "Unknown",
+    city: geo.city || "Unknown",
+  });
+  await click.save();
+
+  res.redirect(url.longUrl);
 });
 
-// --- Analytics ---
-app.get("/an/:shortId", async (req, res) => {
-  const shortId = req.params.shortId;
-  try {
-    const totalClicks = await Click.countDocuments({ shortId });
-    const clicks = await Click.find({ shortId });
+// Analytics
+app.get("/analytics/:shortId", async (req, res) => {
+  const url = await Url.findOne({ shortId: req.params.shortId });
+  if (!url) return res.status(404).json({ error: "Not found" });
 
-    const uniqueVisitors = new Set(clicks.map(c => c.ip)).size;
-
-    // Clicks per hour
-    const clicksPerHour = {};
-    clicks.forEach(c => {
-      const hour = new Date(c.timestamp).getHours();
-      clicksPerHour[hour] = (clicksPerHour[hour] || 0) + 1;
-    });
-
-    res.json({ totalClicks, uniqueVisitors, clicksPerHour });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server Error" });
-  }
+  const clicks = await Click.find({ shortId: url.shortId }).sort({ createdAt: 1 });
+  res.json({ longUrl: url.longUrl, totalClicks: url.clicks, clicks });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Serve static files last
+app.use(express.static(path.join(__dirname, "public")));
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
